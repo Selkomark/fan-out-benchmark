@@ -22,9 +22,14 @@ NUM_SUBSCRIBERS=${NUM_SUBSCRIBERS:-3}
 NUM_PUBLISHERS=${NUM_PUBLISHERS:-3}
 PUBLISH_DURATION_SECONDS=${PUBLISH_DURATION_SECONDS:-10}
 
+# Export variables for docker-compose
+export NUM_SUBSCRIBERS
+export NUM_PUBLISHERS
+export PUBLISH_DURATION_SECONDS
+
 DATA_DIR="$PROJECT_DIR/bench-data"
 
-export BATCH_ID=$(date +%Y%m%dT%H%M%S)
+export BATCH_ID=$(date +%Y-%m-%d_%H-%M-%S)
 
 echo "📋 Configuration:"
 echo "  Subscribers:  $NUM_SUBSCRIBERS"
@@ -45,6 +50,7 @@ fi
 
 # Cleanup function
 cleanup() {
+    echo "Cleaning up..."
     docker-compose -f "$PROJECT_DIR/docker/docker-compose.yml" --profile redis-bench --profile nats-bench down -v 2>/dev/null || true
 }
 
@@ -60,9 +66,9 @@ run_redis_benchmark() {
     docker-compose -f "$PROJECT_DIR/docker/docker-compose.yml" --profile redis-bench up -d redis > /dev/null 2>&1
     docker-compose -f "$PROJECT_DIR/docker/docker-compose.yml" --profile redis-bench up -d --scale redis-subscriber=$NUM_SUBSCRIBERS redis-subscriber > /dev/null 2>&1
     
-    # Wait for subscribers to be ready (give them time to connect and subscribe)
-    echo "⏳ Waiting for subscribers to connect..."
-    sleep 3
+    # Wait for subscribers to be ready (Redis Pub/Sub requires subscribers to be fully subscribed before publishing)
+    echo "⏳ Waiting for subscribers to connect and subscribe..."
+    sleep 5
     
     # Start publisher
     docker-compose -f "$PROJECT_DIR/docker/docker-compose.yml" --profile redis-bench up -d redis-publisher > /dev/null 2>&1
@@ -85,13 +91,6 @@ run_redis_benchmark() {
     
     # Get publisher output
     docker-compose -f "$PROJECT_DIR/docker/docker-compose.yml" --profile redis-bench logs redis-publisher 2>/dev/null | grep -E "Configuration|Results|Throughput|Complete" | head -15
-    
-    # Give subscribers time to finish processing and write final results
-    echo "⏳ Waiting for subscribers to finish..."
-    sleep 12
-    
-    # Collect and aggregate results BEFORE cleanup
-    aggregate_results "Redis" "redis-subscriber"
 }
 
 # Function to run NATS benchmark
@@ -129,53 +128,12 @@ run_nats_benchmark() {
     
     # Get publisher output
     docker-compose -f "$PROJECT_DIR/docker/docker-compose.yml" --profile nats-bench logs nats-publisher 2>/dev/null | grep -E "Configuration|Results|Throughput|Complete" | head -15
-    
-    # Give subscribers time to write final results
-    sleep 12
-    
-    # Collect and aggregate results BEFORE cleanup
-    aggregate_results "NATS" "nats-subscriber"
-}
-
-# Function to aggregate results from scaled subscribers (logs fallback)
-aggregate_results() {
-    local solution=$1
-    local sub_service=$2
-
-    echo ""
-    echo "📊 $solution Results"
-    echo "─────────────────────────────────────────────"
-
-    # Collect results from all scaled subscriber instances
-    local total_messages=0
-    local count=0
-    
-    for container in $(docker ps -a --filter "name=${sub_service}" --format "{{.Names}}" 2>/dev/null | sort); do
-        local logs=$(docker logs "$container" 2>&1)
-        local messages=$(echo "$logs" | grep "Messages Received:" | tail -1 | sed -n 's/.*Messages Received: *\([0-9]*\).*/\1/p')
-        local throughput=$(echo "$logs" | grep "Throughput:" | tail -1 | sed -n 's/.*Throughput: *\([0-9.]*\).*/\1/p')
-        
-        if [ -n "$messages" ] && [ "$messages" -gt 0 ]; then
-            total_messages=$((total_messages + messages))
-            count=$((count + 1))
-            echo "  Instance: $messages msgs, $throughput msg/sec"
-        fi
-    done
-    
-    if [ $count -eq 0 ]; then
-        echo "  ⚠️  No results collected"
-        return 0
-    fi
-    
-    local avg_messages=$((total_messages / count))
-    echo "  Instances: $count | Avg Messages: $avg_messages"
-    echo ""
 }
 
 # Analyze JSON files in /data using DuckDB and print analytics
 analyze_with_duckdb() {
     echo ""
-    echo "📈 DuckDB Analytics"
+    echo "📊 Benchmark Results Summary"
     echo "─────────────────────────────────────────────"
     # Start a one-off DuckDB container with the same bench-data volume
     docker run --rm \
@@ -183,9 +141,27 @@ analyze_with_duckdb() {
       duckdb/duckdb:latest \
       duckdb -c "INSTALL json; LOAD json; \
           CREATE OR REPLACE TABLE results AS SELECT * FROM read_json('/data/$BATCH_ID/*.json'); \
-          SELECT broker_type, COUNT(*) AS files, SUM(messages_received) AS total_msgs, \
-                 ROUND(AVG(throughput_msg_per_sec),2) AS avg_tps \
-          FROM results GROUP BY broker_type;"
+          
+          -- Display configuration
+          SELECT 
+              'Test Configuration' AS info_type,
+              MAX(config['num_publishers']) || ' Publisher' AS publishers,
+              MAX(config['num_subscribers']) || ' Subscribers' AS subscribers,
+              MAX(config['publish_duration_seconds']) || ' seconds' AS duration
+          FROM results 
+          WHERE role = 'publisher'
+          LIMIT 1;
+          
+          -- Display performance metrics
+          SELECT 
+              UPPER(broker_type) AS \"Message Broker\",
+              format('{:,}', COALESCE(MAX(CASE WHEN role = 'publisher' THEN results['messages_published'] END), 0)) AS \"Messages Sent\",
+              format('{:,.0f}', COALESCE(MAX(CASE WHEN role = 'publisher' THEN results['throughput_msg_per_sec'] END), 0)) AS \"Send Rate (msg/s)\",
+              format('{:,}', COALESCE(SUM(CASE WHEN role IS NULL THEN messages_received END), 0)) AS \"Total Received\",
+              format('{:,.0f}', COALESCE(AVG(CASE WHEN role IS NULL THEN throughput_msg_per_sec END), 0)) AS \"Avg Receive Rate (msg/s)\"
+          FROM results 
+          GROUP BY broker_type 
+          ORDER BY broker_type;" 2>&1 | grep -v "varchar\|int64\|BIGINT\|DOUBLE"
 }
 
 # Run benchmarks
@@ -198,8 +174,4 @@ analyze_with_duckdb
 echo "╔═══════════════════════════════════════════════╗"
 echo "║      ✅ Benchmarks Complete!                ║"
 echo "╚═══════════════════════════════════════════════╝"
-
-# Remove trap and cleanup explicitly
-trap - EXIT
-cleanup
-
+echo ""

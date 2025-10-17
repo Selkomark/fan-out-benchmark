@@ -5,6 +5,10 @@
 #include <hiredis/hiredis.h>
 #include <cstring>
 #include <map>
+#include <chrono>
+#include <iostream>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 
 class RedisBroker : public MessageBroker {
 private:
@@ -14,7 +18,8 @@ private:
     int port;
     std::map<std::string, std::function<void(const std::string&)>> callbacks;
     int pipelineCount = 0;
-    const int BATCH_SIZE = 100;
+    const int BATCH_SIZE = 10000;  // Increased for much better throughput
+    bool timeoutConfigured = false;  // Per-instance timeout tracking
 
 public:
     RedisBroker(const std::string& h = "localhost", int p = 6379)
@@ -29,6 +34,21 @@ public:
         if (ctx == nullptr || ctx->err) {
             return false;
         }
+        
+        // CRITICAL: Enable TCP_NODELAY to disable Nagle's algorithm
+        // This prevents batching/delaying of small packets, essential for low-latency pub/sub
+        int fd = ctx->fd;
+        int yes = 1;
+        if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) < 0) {
+            std::cerr << "Warning: Failed to set TCP_NODELAY on Redis connection" << std::endl;
+        }
+        
+        // Increase socket buffer sizes for better throughput
+        int sndbuf = 1024 * 1024;  // 1MB send buffer
+        int rcvbuf = 1024 * 1024;  // 1MB receive buffer
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        
         return true;
     }
     
@@ -50,13 +70,19 @@ public:
     bool publish(const std::string& channel, const std::string& message) override {
         if (!isConnected()) return false;
         
-        // Use redisCommand for immediate send (slower but ensures delivery for pub/sub)
-        redisReply* reply = (redisReply*)redisCommand(ctx, "PUBLISH %s %s", channel.c_str(), message.c_str());
-        bool success = (reply != nullptr);
-        if (reply != nullptr) {
-            freeReplyObject(reply);
+        // Use pipelining for better performance - append command without waiting for reply
+        if (redisAppendCommand(ctx, "PUBLISH %s %s", channel.c_str(), message.c_str()) != REDIS_OK) {
+            return false;
         }
-        return success;
+        
+        pipelineCount++;
+        
+        // Auto-flush when batch size reached
+        if (pipelineCount >= BATCH_SIZE) {
+            flush();
+        }
+        
+        return true;
     }
     
     void flush() override {
@@ -79,6 +105,19 @@ public:
             if (subCtx == nullptr || subCtx->err) {
                 return false;
             }
+            
+            // CRITICAL: Enable TCP_NODELAY on subscription connection too
+            int fd = subCtx->fd;
+            int yes = 1;
+            if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) < 0) {
+                std::cerr << "Warning: Failed to set TCP_NODELAY on Redis subscription" << std::endl;
+            }
+            
+            // Increase socket buffer sizes
+            int sndbuf = 1024 * 1024;  // 1MB
+            int rcvbuf = 1024 * 1024;  // 1MB
+            setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
         }
         
         callbacks[channel] = callback;
@@ -115,25 +154,54 @@ public:
     void processMessages(int timeoutMs = 1000) override {
         if (subCtx == nullptr) return;
         
-        struct timeval timeout;
-        timeout.tv_sec = timeoutMs / 1000;
-        timeout.tv_usec = (timeoutMs % 1000) * 1000;
-        redisSetTimeout(subCtx, timeout);
+        // Configure timeout once per instance (not static!)
+        if (!timeoutConfigured) {
+            struct timeval timeout;
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 1000;  // 1ms timeout for non-blocking behavior
+            
+            if (redisSetTimeout(subCtx, timeout) == REDIS_OK) {
+                timeoutConfigured = true;
+            }
+        }
         
-        redisReply* reply = nullptr;
-        if (redisGetReply(subCtx, (void**)&reply) == REDIS_OK && reply != nullptr) {
-            if (reply->type == REDIS_REPLY_ARRAY && reply->elements >= 3) {
-                if (strcmp(reply->element[0]->str, "message") == 0) {
-                    std::string channel = reply->element[1]->str;
-                    std::string message = reply->element[2]->str;
-                    
-                    auto it = callbacks.find(channel);
-                    if (it != callbacks.end()) {
-                        it->second(message);
+        // Process multiple messages per call for better throughput
+        auto endTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        
+        while (std::chrono::steady_clock::now() < endTime) {
+            redisReply* reply = nullptr;
+            int status = redisGetReply(subCtx, (void**)&reply);
+            
+            if (status == REDIS_OK && reply != nullptr) {
+                // Successfully received a message
+                if (reply->type == REDIS_REPLY_ARRAY && reply->elements >= 3) {
+                    if (strcmp(reply->element[0]->str, "message") == 0) {
+                        std::string channel = reply->element[1]->str;
+                        std::string message = reply->element[2]->str;
+                        
+                        auto it = callbacks.find(channel);
+                        if (it != callbacks.end()) {
+                            it->second(message);
+                        }
                     }
                 }
+                freeReplyObject(reply);
+            } else if (status == REDIS_ERR) {
+                // Check if it's just a timeout (EAGAIN/EWOULDBLOCK) which is normal
+                if (subCtx->err == REDIS_ERR_IO) {
+                    // Clear the error - timeout is not a fatal error for pub/sub
+                    subCtx->err = 0;
+                    memset(subCtx->errstr, 0, sizeof(subCtx->errstr));
+                    break;  // No more messages available, exit loop
+                } else if (subCtx->err != 0) {
+                    // Actual error - log it
+                    std::cerr << "Redis subscriber error: " << subCtx->errstr << std::endl;
+                    break;
+                }
+            } else {
+                // No reply available
+                break;
             }
-            freeReplyObject(reply);
         }
     }
     

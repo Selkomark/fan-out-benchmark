@@ -1,4 +1,5 @@
 version: '3.8'
+name: benchmark-fanout
 
 services:
   # Redis server
@@ -48,6 +49,7 @@ services:
       - REDIS_PORT=6379
       - SUBSCRIBER_ID=redis_subscriber
       - BATCH_ID=${BATCH_ID}
+      - PUBLISH_DURATION_SECONDS=${PUBLISH_DURATION_SECONDS}
     depends_on:
       redis:
         condition: service_healthy
@@ -72,6 +74,9 @@ services:
       - BROKER_TYPE=redis
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - BATCH_ID=${BATCH_ID}
+      - NUM_SUBSCRIBERS=${NUM_SUBSCRIBERS}
+      - PUBLISH_DURATION_SECONDS=${PUBLISH_DURATION_SECONDS}
     depends_on:
       redis:
         condition: service_healthy
@@ -79,6 +84,7 @@ services:
       - benchmark-net
     volumes:
       - ../.env:/app/.env:ro
+      - ../bench-data:/data
     profiles:
       - redis-bench
     cpus: 0.3
@@ -95,6 +101,7 @@ services:
       - NATS_URL=nats://nats:4222
       - SUBSCRIBER_ID=nats_subscriber
       - BATCH_ID=${BATCH_ID}
+      - PUBLISH_DURATION_SECONDS=${PUBLISH_DURATION_SECONDS}
     depends_on:
       nats:
         condition: service_healthy
@@ -118,6 +125,9 @@ services:
     environment:
       - BROKER_TYPE=nats
       - NATS_URL=nats://nats:4222
+      - BATCH_ID=${BATCH_ID}
+      - NUM_SUBSCRIBERS=${NUM_SUBSCRIBERS}
+      - PUBLISH_DURATION_SECONDS=${PUBLISH_DURATION_SECONDS}
     depends_on:
       nats:
         condition: service_healthy
@@ -125,6 +135,7 @@ services:
       - benchmark-net
     volumes:
       - ../.env:/app/.env:ro
+      - ../bench-data:/data
     profiles:
       - nats-bench
     cpus: 0.3

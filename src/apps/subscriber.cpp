@@ -77,8 +77,14 @@ int main() {
     // Wait for messages until benchmark ends or timeout
     bool benchmarkEnded = false;
     auto waitStart = std::chrono::steady_clock::now();
-    const int TIMEOUT_SECONDS = 20; // 20 second timeout
-    const int NO_MESSAGE_TIMEOUT_SECONDS = 10; // Exit if no START received after 10 seconds
+    
+    // Get timeout from environment variable PUBLISH_DURATION_SECONDS + buffer
+    int publishDuration = 10; // default
+    if (std::getenv("PUBLISH_DURATION_SECONDS")) {
+        publishDuration = std::atoi(std::getenv("PUBLISH_DURATION_SECONDS"));
+    }
+    const int TIMEOUT_SECONDS = publishDuration + 15; // Publish duration + 15 second buffer
+    const int NO_MESSAGE_TIMEOUT_SECONDS = 15; // Exit if no START received after 15 seconds
     
     while (!benchmarkEnded) {
         broker->processMessages(100);

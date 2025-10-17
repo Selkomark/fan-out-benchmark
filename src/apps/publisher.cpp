@@ -9,6 +9,11 @@
 #include <vector>
 #include <atomic>
 #include <memory>
+#include <fstream>
+#include <sstream>
+#include <cstring>
+#include <unistd.h>
+#include <sys/stat.h>
 
 std::atomic<uint64_t> totalMessagesPublished(0);
 std::mutex resultsMutex;
@@ -43,11 +48,17 @@ void publisherThread(int publisherId,
         broker->publish(channel, "START_BENCHMARK");
         broker->flush();  // Flush immediately to ensure START signal is sent
         
+        // Give subscribers a moment to receive and process START signal before flood begins
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        
         {
             std::lock_guard<std::mutex> lock(resultsMutex);
             firstMessageTime = std::chrono::steady_clock::now();
         }
     }
+    
+    // Wait for all threads to receive START signal before publishing
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
     // Publish messages for the specified duration
     while (std::chrono::steady_clock::now() < endTime) {
@@ -146,6 +157,78 @@ int main() {
     std::cout << "Avg per Publisher:      " << std::fixed << std::setprecision(0) 
               << (throughput / numPublishers) << " msg/sec" << std::endl;
     std::cout << "========================================\n" << std::endl;
+
+    // Write results to JSON file for analytics
+    struct stat st;
+    if (stat("/data", &st) != 0) {
+        ::mkdir("/data", 0755);
+    }
+    
+    // Get hostname
+    const char* hostnameEnv = std::getenv("HOSTNAME");
+    char hostbuf[128] = {0};
+    if (!hostnameEnv) {
+        if (gethostname(hostbuf, sizeof(hostbuf) - 1) != 0) {
+            std::snprintf(hostbuf, sizeof(hostbuf), "unknown-host");
+        }
+    }
+    std::string hostname = hostnameEnv ? std::string(hostnameEnv) : std::string(hostbuf);
+
+    // Get timestamp
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_struct;
+#ifdef _WIN32
+    localtime_s(&tm_struct, &now_c);
+#else
+    localtime_r(&now_c, &tm_struct);
+#endif
+    char tsbuf[32];
+    std::strftime(tsbuf, sizeof(tsbuf), "%Y%m%dT%H%M%S", &tm_struct);
+
+    // Determine batch id and directory
+    const char* batchEnv = std::getenv("BATCH_ID");
+    std::string batchId = batchEnv ? std::string(batchEnv) : std::string(tsbuf);
+    std::string batchDir = std::string("/data/") + batchId;
+    if (stat(batchDir.c_str(), &st) != 0) {
+        ::mkdir(batchDir.c_str(), 0755);
+    }
+
+    // Get environment configuration
+    int numSubscribers = 1;
+    if (std::getenv("NUM_SUBSCRIBERS")) {
+        numSubscribers = std::atoi(std::getenv("NUM_SUBSCRIBERS"));
+    }
+
+    std::ostringstream filepath;
+    filepath << batchDir << "/" << brokerType << "_publisher_" << hostname << "_" << tsbuf << ".json";
+    std::ofstream out(filepath.str());
+    if (out.is_open()) {
+        out << "{\n";
+        out << "  \"batch_id\": \"" << batchId << "\",\n";
+        out << "  \"broker_type\": \"" << brokerType << "\",\n";
+        out << "  \"role\": \"publisher\",\n";
+        out << "  \"host\": \"" << hostname << "\",\n";
+        out << "  \"timestamp\": \"" << tsbuf << "\",\n";
+        out << "  \"config\": {\n";
+        out << "    \"num_publishers\": " << numPublishers << ",\n";
+        out << "    \"num_subscribers\": " << numSubscribers << ",\n";
+        out << "    \"publish_duration_seconds\": " << publishDurationSeconds << "\n";
+        out << "  },\n";
+        out << "  \"results\": {\n";
+        out << "    \"messages_published\": " << totalMessagesPublished << ",\n";
+        out << "    \"duration_ms\": " << totalDuration.count() << ",\n";
+        out << "    \"duration_seconds\": " << std::fixed << std::setprecision(3) << totalSeconds << ",\n";
+        out << "    \"throughput_msg_per_sec\": " << std::fixed << std::setprecision(2) << throughput << ",\n";
+        out << "    \"avg_per_publisher_msg_per_sec\": " << std::fixed << std::setprecision(2) << (throughput / numPublishers) << "\n";
+        out << "  }\n";
+        out << "}\n";
+        out.flush();
+        out.close();
+        std::cerr << "✓ Wrote publisher results to " << filepath.str() << std::endl;
+    } else {
+        std::cerr << "⚠️  Failed to write publisher results file: " << filepath.str() << std::endl;
+    }
 
     std::cout << "✅ " << broker->getName() << " Publisher Complete!\n" << std::endl;
 
