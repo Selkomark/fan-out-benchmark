@@ -7,8 +7,9 @@
 #include <map>
 #include <chrono>
 #include <iostream>
-#include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 
 class RedisBroker : public MessageBroker {
 private:
@@ -18,7 +19,7 @@ private:
     int port;
     std::map<std::string, std::function<void(const std::string&)>> callbacks;
     int pipelineCount = 0;
-    const int BATCH_SIZE = 10000;  // Increased for much better throughput
+    const int BATCH_SIZE = 1000;  // Balanced for throughput and responsiveness
     bool timeoutConfigured = false;  // Per-instance timeout tracking
 
 public:
@@ -30,10 +31,14 @@ public:
     }
     
     bool connect() override {
-        ctx = redisConnect(host.c_str(), port);
+        struct timeval timeout = { 5, 0 };  // 5 second timeout for pub context
+        ctx = redisConnectWithTimeout(host.c_str(), port, timeout);
         if (ctx == nullptr || ctx->err) {
             return false;
         }
+        
+        // Set read/write timeouts to prevent indefinite blocking
+        redisSetTimeout(ctx, timeout);
         
         // CRITICAL: Enable TCP_NODELAY to disable Nagle's algorithm
         // This prevents batching/delaying of small packets, essential for low-latency pub/sub
@@ -70,32 +75,49 @@ public:
     bool publish(const std::string& channel, const std::string& message) override {
         if (!isConnected()) return false;
         
-        // Use pipelining for better performance - append command without waiting for reply
-        if (redisAppendCommand(ctx, "PUBLISH %s %s", channel.c_str(), message.c_str()) != REDIS_OK) {
-            return false;
+        // Use synchronous publish with TCP_NODELAY for reliable delivery
+        // TCP_NODELAY ensures low latency despite synchronous calls
+        redisReply* reply = (redisReply*)redisCommand(ctx, "PUBLISH %s %b", 
+                                                       channel.c_str(), 
+                                                       message.c_str(), 
+                                                       message.length());
+        bool success = (reply != nullptr);
+        if (reply != nullptr) {
+            freeReplyObject(reply);
         }
-        
-        pipelineCount++;
-        
-        // Auto-flush when batch size reached
-        if (pipelineCount >= BATCH_SIZE) {
-            flush();
-        }
-        
-        return true;
+        return success;
     }
     
     void flush() override {
         if (!isConnected() || pipelineCount == 0) return;
         
+        int count = pipelineCount;
+        pipelineCount = 0;  // Reset immediately to avoid issues
+        
         // Read all pending replies - this triggers sending buffered commands
-        for (int i = 0; i < pipelineCount; i++) {
+        for (int i = 0; i < count; i++) {
             redisReply* reply = nullptr;
-            if (redisGetReply(ctx, (void**)&reply) == REDIS_OK && reply != nullptr) {
+            int status = redisGetReply(ctx, (void**)&reply);
+            
+            if (status != REDIS_OK) {
+                if (ctx->err) {
+                    std::cerr << "Redis flush error: " << ctx->errstr << std::endl;
+                }
+                // Clean up any remaining replies
+                while (i < count) {
+                    redisReply* dummy = nullptr;
+                    if (redisGetReply(ctx, (void**)&dummy) == REDIS_OK && dummy != nullptr) {
+                        freeReplyObject(dummy);
+                    }
+                    i++;
+                }
+                return;
+            }
+            
+            if (reply != nullptr) {
                 freeReplyObject(reply);
             }
         }
-        pipelineCount = 0;
     }
     
     bool subscribe(const std::string& channel,

@@ -2,7 +2,9 @@ version: '3.8'
 name: benchmark-fanout
 
 services:
+  #############################
   # Redis server
+  #############################
   redis:
     image: redis:7-alpine
     container_name: benchmark-redis
@@ -16,28 +18,11 @@ services:
       interval: 2s
       timeout: 3s
       retries: 10
+    profiles:
+      - redis-bench
     cpus: 0.3
     mem_limit: 300m
 
-  # NATS server
-  nats:
-    image: nats:2.10-alpine
-    container_name: benchmark-nats
-    ports:
-      - "4222:4222"
-      - "8222:8222"
-    command: ["-js", "-m", "8222"]
-    networks:
-      - benchmark-net
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8222/healthz"]
-      interval: 2s
-      timeout: 3s
-      retries: 10
-    cpus: 0.3
-    mem_limit: 300m
-
-  # Redis Subscribers (scalable - use 'docker-compose up --scale redis-subscriber=N')
   redis-subscriber:
     build:
       context: ..
@@ -63,7 +48,6 @@ services:
     cpus: 0.3
     mem_limit: 300m
 
-  # Redis Publisher
   redis-publisher:
     build:
       context: ..
@@ -90,7 +74,28 @@ services:
     cpus: 0.3
     mem_limit: 300m
 
-  # NATS Subscribers (scalable - use 'docker-compose up --scale nats-subscriber=N')
+  #############################
+  # NATS server
+  #############################
+  nats:
+    image: nats:2.10-alpine
+    container_name: benchmark-nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["-js", "-m", "8222"]
+    networks:
+      - benchmark-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    profiles:
+      - nats-bench
+    cpus: 0.3
+    mem_limit: 300m
+
   nats-subscriber:
     build:
       context: ..
@@ -115,7 +120,6 @@ services:
     cpus: 0.3
     mem_limit: 300m
 
-  # NATS Publisher
   nats-publisher:
     build:
       context: ..
@@ -150,4 +154,3 @@ volumes:
   nats-logs:
   redis-results:
   nats-results:
-

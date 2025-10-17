@@ -35,13 +35,27 @@ std::unique_ptr<MessageBroker> createBroker(const std::string& brokerType) {
 void publisherThread(int publisherId,
                     int numPublishers,
                     int publishDurationSeconds,
-                    MessageBroker* broker,
+                    const std::string& brokerType,
                     const std::string& channel,
                     std::chrono::steady_clock::time_point endTime,
                     std::chrono::steady_clock::time_point& firstMessageTime,
                     std::chrono::steady_clock::time_point& lastMessageTime) {
     uint64_t messagesPublished = 0;
     uint64_t messageCounter = 0;
+
+    // Each thread needs its own connection (Redis connections are NOT thread-safe!)
+    auto broker = createBroker(brokerType);
+    if (!broker) {
+        std::cerr << "❌ Thread " << publisherId << " failed to create broker" << std::endl;
+        return;
+    }
+    
+    if (!broker->connect()) {
+        std::cerr << "❌ Thread " << publisherId << " failed to connect" << std::endl;
+        return;
+    }
+    
+    std::cerr << "✓ Thread " << publisherId << " connected successfully" << std::endl;
 
     // Send START marker only from first publisher
     if (publisherId == 0) {
@@ -83,6 +97,13 @@ void publisherThread(int publisherId,
     }
 
     totalMessagesPublished.fetch_add(messagesPublished, std::memory_order_relaxed);
+    
+    std::cerr << "✓ Thread " << publisherId << " published " << messagesPublished << " messages" << std::endl;
+    
+    // Clean up thread-local connection
+    broker->disconnect();
+    
+    std::cerr << "✓ Thread " << publisherId << " disconnected and exiting" << std::endl;
 }
 
 int main() {
@@ -99,22 +120,17 @@ int main() {
         brokerType = std::getenv("BROKER_TYPE");
     }
     
-    auto broker = createBroker(brokerType);
-    if (!broker) {
+    // Create a test broker just to get the name (threads will create their own connections)
+    auto testBroker = createBroker(brokerType);
+    if (!testBroker) {
         std::cerr << "❌ Unknown broker type: " << brokerType << std::endl;
         return 1;
     }
 
-    printHeader(broker->getName() + " Publisher Benchmark");
+    printHeader(testBroker->getName() + " Publisher Benchmark");
     
-    std::cout << "\n🚀 Starting " << broker->getName() << " Publisher..." << std::endl;
-
-    // Connect to broker
-    if (!broker->connect()) {
-        std::cerr << "❌ Connection error" << std::endl;
-        return 1;
-    }
-    std::cout << "✓ Connected to " << broker->getName() << std::endl;
+    std::cout << "\n🚀 Starting " << testBroker->getName() << " Publisher..." << std::endl;
+    std::cout << "✓ Each publisher thread will create its own connection" << std::endl;
 
     // Calculate end time
     auto startTime = std::chrono::steady_clock::now();
@@ -126,11 +142,11 @@ int main() {
     std::chrono::steady_clock::time_point firstMessageTime;
     std::chrono::steady_clock::time_point lastMessageTime;
 
-    // Launch publisher threads
+    // Launch publisher threads - each will create its own connection
     std::vector<std::thread> threads;
     for (int i = 0; i < numPublishers; i++) {
         threads.emplace_back(publisherThread, i, numPublishers, publishDurationSeconds,
-                           broker.get(), "benchmark_channel",
+                           brokerType, "benchmark_channel",
                            endTime, std::ref(firstMessageTime), std::ref(lastMessageTime));
     }
 
@@ -147,7 +163,7 @@ int main() {
     double throughput = totalSeconds > 0 ? totalMessagesPublished / totalSeconds : 0;
 
     std::cout << "\n========================================" << std::endl;
-    std::cout << broker->getName() << " Publisher Results:" << std::endl;
+    std::cout << testBroker->getName() << " Publisher Results:" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "Concurrent Publishers:  " << numPublishers << std::endl;
     std::cout << "Duration:               " << publishDurationSeconds << " seconds" << std::endl;
@@ -230,8 +246,7 @@ int main() {
         std::cerr << "⚠️  Failed to write publisher results file: " << filepath.str() << std::endl;
     }
 
-    std::cout << "✅ " << broker->getName() << " Publisher Complete!\n" << std::endl;
+    std::cout << "✅ " << testBroker->getName() << " Publisher Complete!\n" << std::endl;
 
-    broker->disconnect();
     return 0;
 }

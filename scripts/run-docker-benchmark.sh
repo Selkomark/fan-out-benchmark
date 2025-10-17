@@ -51,7 +51,7 @@ fi
 # Cleanup function
 cleanup() {
     echo "Cleaning up..."
-    docker-compose -f "$PROJECT_DIR/docker/docker-compose.yml" --profile redis-bench --profile nats-bench down -v 2>/dev/null || true
+    # docker-compose -f "$PROJECT_DIR/docker/docker-compose.yml" --profile redis-bench --profile nats-bench down -v 2>/dev/null || true
 }
 
 # Set trap to cleanup on exit

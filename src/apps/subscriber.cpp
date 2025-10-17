@@ -19,6 +19,12 @@ std::atomic<bool> benchmarkEnded_Flag(false);
 std::chrono::steady_clock::time_point startTime;
 std::chrono::steady_clock::time_point endTime;
 
+// Global broker type for results writing
+std::string g_brokerType;
+
+// Forward declaration
+void writeResults(const char* subscriberId);
+
 std::unique_ptr<MessageBroker> createBroker(const std::string& brokerType) {
     if (brokerType == "redis") {
         return std::make_unique<RedisBroker>(
@@ -38,9 +44,11 @@ void messageCallback(const std::string& message) {
         benchmarkStarted = true;
         startTime = std::chrono::steady_clock::now();
     } else if (message == "END_BENCHMARK") {
-        endTime = std::chrono::steady_clock::now();
-        benchmarkEnded_Flag = true;
-    } else if (benchmarkStarted) {
+        if (!benchmarkEnded_Flag) {
+            endTime = std::chrono::steady_clock::now();
+            benchmarkEnded_Flag = true;
+        }
+    } else if (benchmarkStarted && !benchmarkEnded_Flag) {
         messagesReceived++;
     }
 }
@@ -49,10 +57,11 @@ int main() {
     const char* subscriberId = std::getenv("SUBSCRIBER_ID") ? std::getenv("SUBSCRIBER_ID") : "subscriber_1";
     
     // Determine broker type from environment variable
-    std::string brokerType = "redis";
+    g_brokerType = "redis";
     if (std::getenv("BROKER_TYPE")) {
-        brokerType = std::getenv("BROKER_TYPE");
+        g_brokerType = std::getenv("BROKER_TYPE");
     }
+    std::string brokerType = g_brokerType;
     
     auto broker = createBroker(brokerType);
     if (!broker) {
@@ -73,53 +82,28 @@ int main() {
         return 1;
     }
     std::cerr << "✓ Subscribed to benchmark_channel" << std::endl;
+    std::cerr << "✓ Subscriber ready - waiting for messages (will run until stopped)" << std::endl;
 
-    // Wait for messages until benchmark ends or timeout
-    bool benchmarkEnded = false;
-    auto waitStart = std::chrono::steady_clock::now();
+    // Run continuously - process messages and write results when benchmark ends
+    bool resultsWritten = false;
     
-    // Get timeout from environment variable PUBLISH_DURATION_SECONDS + buffer
-    int publishDuration = 10; // default
-    if (std::getenv("PUBLISH_DURATION_SECONDS")) {
-        publishDuration = std::atoi(std::getenv("PUBLISH_DURATION_SECONDS"));
-    }
-    const int TIMEOUT_SECONDS = publishDuration + 15; // Publish duration + 15 second buffer
-    const int NO_MESSAGE_TIMEOUT_SECONDS = 15; // Exit if no START received after 15 seconds
-    
-    while (!benchmarkEnded) {
+    while (true) {
         broker->processMessages(100);
         
-        auto elapsedOverall = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - waitStart);
-        
-        // Exit if benchmark ended
-        if (benchmarkEnded_Flag) {
-            benchmarkEnded = true;
-        }
-        // Exit if no START message received after NO_MESSAGE_TIMEOUT_SECONDS
-        else if (elapsedOverall.count() > NO_MESSAGE_TIMEOUT_SECONDS && !benchmarkStarted) {
-            benchmarkEnded = true;
-            // Set times if benchmark never started (so we output valid results)
-            if (startTime.time_since_epoch().count() == 0) {
-                startTime = waitStart;
-            }
-            if (endTime.time_since_epoch().count() == 0) {
-                endTime = std::chrono::steady_clock::now();
-            }
-        }
-        // Exit if total timeout exceeded
-        else if (elapsedOverall.count() > TIMEOUT_SECONDS) {
-            benchmarkEnded = true;
-            // Set times if benchmark never started (so we output valid results)
-            if (startTime.time_since_epoch().count() == 0) {
-                startTime = waitStart;
-            }
-            if (endTime.time_since_epoch().count() == 0) {
-                endTime = std::chrono::steady_clock::now();
-            }
+        // Write results once when benchmark ends, but keep running
+        if (benchmarkEnded_Flag && !resultsWritten) {
+            writeResults(subscriberId);
+            resultsWritten = true;
+            std::cerr << "✓ Benchmark results written - subscriber continues running" << std::endl;
         }
     }
     
+    // This code is unreachable but kept for clarity
+    broker->disconnect();
+    return 0;
+}
+
+void writeResults(const char* subscriberId) {
     // Calculate and log results
     auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
@@ -172,12 +156,12 @@ int main() {
     }
 
     std::ostringstream filepath;
-    filepath << batchDir << "/" << brokerType << "_" << subscriberId << "_" << hostname << "_" << tsbuf << ".json";
+    filepath << batchDir << "/" << g_brokerType << "_" << subscriberId << "_" << hostname << "_" << tsbuf << ".json";
     std::ofstream out(filepath.str());
     if (out.is_open()) {
         out << "{\n";
         out << "  \"batch_id\": \"" << batchId << "\",\n";
-        out << "  \"broker_type\": \"" << brokerType << "\",\n";
+        out << "  \"broker_type\": \"" << g_brokerType << "\",\n";
         out << "  \"subscriber_id\": \"" << subscriberId << "\",\n";
         out << "  \"host\": \"" << hostname << "\",\n";
         out << "  \"timestamp\": \"" << tsbuf << "\",\n";
@@ -202,7 +186,4 @@ int main() {
     std::cout << "Throughput:             " << std::fixed << std::setprecision(2) << throughput << " msg/sec" << std::endl;
     std::cout << "========================================\n" << std::endl;
     std::cout.flush();
-
-    broker->disconnect();
-    return 0;
 }
