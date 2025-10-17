@@ -1,0 +1,142 @@
+version: '3.8'
+
+services:
+  # Redis server
+  redis:
+    image: redis:7-alpine
+    container_name: benchmark-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --save "" --appendonly no
+    networks:
+      - benchmark-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    cpus: 0.3
+    mem_limit: 300m
+
+  # NATS server
+  nats:
+    image: nats:2.10-alpine
+    container_name: benchmark-nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["-js", "-m", "8222"]
+    networks:
+      - benchmark-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    cpus: 0.3
+    mem_limit: 300m
+
+  # Redis Subscribers (scalable - use 'docker-compose up --scale redis-subscriber=N')
+  redis-subscriber:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ./subscriber
+    environment:
+      - BROKER_TYPE=redis
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - SUBSCRIBER_ID=redis_subscriber
+      - BATCH_ID=${BATCH_ID}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - benchmark-net
+    volumes:
+      - redis-results:/app/results
+      - ../bench-data:/data
+    profiles:
+      - redis-bench
+    cpus: 0.3
+    mem_limit: 300m
+
+  # Redis Publisher
+  redis-publisher:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: redis-publisher
+    command: ./publisher
+    environment:
+      - BROKER_TYPE=redis
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - benchmark-net
+    volumes:
+      - ../.env:/app/.env:ro
+    profiles:
+      - redis-bench
+    cpus: 0.3
+    mem_limit: 300m
+
+  # NATS Subscribers (scalable - use 'docker-compose up --scale nats-subscriber=N')
+  nats-subscriber:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ./subscriber
+    environment:
+      - BROKER_TYPE=nats
+      - NATS_URL=nats://nats:4222
+      - SUBSCRIBER_ID=nats_subscriber
+      - BATCH_ID=${BATCH_ID}
+    depends_on:
+      nats:
+        condition: service_healthy
+    networks:
+      - benchmark-net
+    volumes:
+      - nats-results:/app/results
+      - ../bench-data:/data
+    profiles:
+      - nats-bench
+    cpus: 0.3
+    mem_limit: 300m
+
+  # NATS Publisher
+  nats-publisher:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: nats-publisher
+    command: ./publisher
+    environment:
+      - BROKER_TYPE=nats
+      - NATS_URL=nats://nats:4222
+    depends_on:
+      nats:
+        condition: service_healthy
+    networks:
+      - benchmark-net
+    volumes:
+      - ../.env:/app/.env:ro
+    profiles:
+      - nats-bench
+    cpus: 0.3
+    mem_limit: 300m
+
+networks:
+  benchmark-net:
+    driver: bridge
+
+volumes:
+  redis-logs:
+  nats-logs:
+  redis-results:
+  nats-results:
+

@@ -1,0 +1,41 @@
+# Compiled binaries
+benchmark
+redis_benchmark
+nats_benchmark
+
+# Build directories
+build/
+cmake-build-*/
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.generated
+
+# Object files
+*.o
+*.obj
+
+# Executables
+*.exe
+*.out
+*.app
+
+# IDE specific
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Temporary files
+*.tmp
+*.log
+
+# Docker volumes
+.docker-volumes/
+

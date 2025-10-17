@@ -1,0 +1,11 @@
+{
+  "batch_id": "20251017T112632",
+  "broker_type": "nats",
+  "subscriber_id": "nats_subscriber",
+  "host": "2725340e4b73",
+  "timestamp": "20251017T092710",
+  "messages_received": 3319121,
+  "duration_us": 6561262,
+  "duration_ms": 6561,
+  "throughput_msg_per_sec": 505866.25
+}
